@@ -607,10 +607,15 @@ def _(context, mo):
     bundled_controls = mo.ui.dictionary(controls)
     prediction_form = mo.ui.form(
         bundled_controls,
-        submit_button_label="Predict Property Price",
+        submit_button_label="Run Detailed Predict",
         bordered=False,
         show_clear_button=True,
         clear_button_label="Reset",
+    )
+    predict_button = mo.ui.run_button(label="Run Quick Predict")
+    prediction_mode_switch = mo.ui.switch(
+        label="Detailed Predict",
+        value=False,
     )
     return (
         controls,
@@ -618,6 +623,8 @@ def _(context, mo):
         feature_order_list,
         name_to_field,
         prediction_form,
+        prediction_mode_switch,
+        predict_button,
     )
 
 
@@ -633,6 +640,8 @@ def _(
     pd,
     pipeline,
     prediction_form,
+    prediction_mode_switch,
+    predict_button,
     status_msg,
     training_controls,
     training_history_df,
@@ -665,6 +674,7 @@ def _(
     live_area = float(control_value("AREA") or 0.0)
     live_location = control_value("LOCATION") or ""
     live_building = control_value("BUILDING TYPE") or ""
+    button_triggered = predict_button.value > 0
 
     storey_value = control_value("STOREY/LEVEL")
     if storey_value in (None, ""):
@@ -724,15 +734,36 @@ def _(
         card("Location", controls[name_to_field["LOCATION"]]),
     ]
 
-    property_section = mo.vstack(
-        [
-            mo.md("### Property Details"),
-            mo.hstack(
-                property_cards, gap=1, widths=[1] * len(property_cards), wrap=True
-            ),
-        ],
-        align="stretch",
-        gap=0.6,
+    detailed_mode = bool(prediction_mode_switch.value)
+    mode_label = "Detailed" if detailed_mode else "Quick"
+
+    mode_toggle = mo.hstack(
+        [mo.md("**Detailed Predict**"), prediction_mode_switch],
+        gap=0.35,
+        align="center",
+        wrap=True,
+    )
+
+    mode_controls: list[object] = []
+    if not detailed_mode:
+        mode_controls.append(predict_button)
+    mode_controls.append(mode_toggle)
+
+    mode_controls_row = mo.hstack(mode_controls, gap=0.8, align="center", wrap=True)
+
+    if detailed_mode:
+        mode_help_text = (
+            "**Detailed Predict** lets you override every feature using the full form. Submit the detailed form to refresh the estimate."
+        )
+    else:
+        mode_help_text = (
+            "**Quick Predict** uses the property cards above. Toggle Detailed Predict to switch into the comprehensive workflow."
+        )
+
+    prediction_mode_card = card(
+        "Prediction Modes",
+        mo.vstack([mo.md(mode_help_text)], align="stretch", gap=0.2),
+        kind="neutral",
     )
 
     advanced_elements = [controls[name_to_field[name]] for name in advanced_names]
@@ -1041,9 +1072,6 @@ def _(
             multiple=False,
         )
 
-    bundled_form_section = mo.callout(prediction_form, kind="danger")
-
-
     def form_payload(form_value: dict | None) -> dict:
         payload: dict[str, float | str | None] = {}
         if not form_value:
@@ -1056,6 +1084,13 @@ def _(
                 field_id, ctx_defaults.get(feature["name"])
             )
         return payload
+
+    def payload_from_controls() -> dict[str, float | str | None]:
+        live_payload: dict[str, float | str | None] = {}
+        for feature in feature_contract:
+            name = feature["name"]
+            live_payload[name] = control_value(name)
+        return live_payload
 
     def predict_price(payload: dict):
         if pipeline is None or not payload:
@@ -1076,8 +1111,21 @@ def _(
             "high": prediction + spread,
         }
 
-    submitted_payload = form_payload(prediction_form.value)
-    prediction = predict_price(submitted_payload)
+    form_submission = prediction_form.value
+    triggered_by_form = bool(form_submission)
+    triggered_by_button = button_triggered and not detailed_mode
+
+    quick_payload = payload_from_controls()
+    detailed_payload = form_payload(form_submission) if triggered_by_form else {}
+
+    if detailed_mode:
+        submitted_payload = detailed_payload
+        prediction_ready = triggered_by_form
+    else:
+        submitted_payload = quick_payload
+        prediction_ready = triggered_by_button
+
+    prediction = predict_price(submitted_payload) if prediction_ready else None
 
     def format_currency(value: float) -> str:
         return f"RM {value:,.0f}" if value is not None else "RM 0"
@@ -1086,11 +1134,16 @@ def _(
         prediction_section = mo.callout(
             "Train or load the model to enable predictions.", kind="warn"
         )
-    elif prediction is None or not prediction_form.value:
-        prediction_section = mo.callout(
-            "Fill in the form above and click **Predict Property Price** to generate an estimate.",
-            kind="neutral",
-        )
+    elif not prediction_ready or prediction is None:
+        if detailed_mode:
+            prompt = (
+                "Complete the detailed form below and click **Run Detailed Predict** to generate an estimate."
+            )
+        else:
+            prompt = (
+                "Adjust the property details above and click **Run Quick Predict** to generate an estimate."
+            )
+        prediction_section = mo.callout(prompt, kind="neutral")
     else:
         estimate = prediction["prediction"]
         low = prediction["low"]
@@ -1117,7 +1170,7 @@ def _(
 
         prediction_section = mo.vstack(
             [
-                mo.md("### Price Prediction"),
+                mo.md(f"### {mode_label} Prediction"),
                 mo.hstack(
                     [price_callout, pps_callout],
                     gap=1,
@@ -1135,9 +1188,43 @@ def _(
             gap=0.6,
         )
 
+    property_content = [
+        mo.md("### Property Details"),
+        mo.hstack(
+            property_cards, gap=1, widths=[1] * len(property_cards), wrap=True
+        ),
+        mode_controls_row,
+    ]
+    if not detailed_mode:
+        property_content.append(prediction_section)
+    property_content.append(prediction_mode_card)
+    property_section = mo.vstack(
+        property_content,
+        align="stretch",
+        gap=0.6,
+    )
+
+    detailed_form_section = None
+    if detailed_mode:
+        detailed_form_section = card(
+            "Detailed Predict",
+            mo.vstack(
+                [
+                    mo.md(
+                        "Use the full feature dictionary for nuanced scenarios, then run **Run Detailed Predict**."
+                    ),
+                    prediction_form,
+                    prediction_section,
+                ],
+                align="stretch",
+                gap=0.45,
+            ),
+            kind="danger",
+        )
+
     summary_source = (
         submitted_payload
-        if prediction_form.value
+        if prediction_ready and submitted_payload
         else {name: control_value(name) for name in primary_names}
     )
     summary_lines = [
@@ -1164,19 +1251,14 @@ def _(
     )
 
     sections = [header, property_section]
+    if detailed_form_section is not None:
+        sections.append(detailed_form_section)
     if advanced_section is not None:
         sections.append(advanced_section)
     sections.append(auto_section)
     sections.append(market_section)
     sections.append(model_section)
-    sections.extend(
-        [
-            bundled_form_section,
-            prediction_section,
-            summary_section,
-            contract_section,
-        ]
-    )
+    sections.extend([summary_section, contract_section])
 
     mo.vstack(sections, align="stretch", gap=1.2)
     return
