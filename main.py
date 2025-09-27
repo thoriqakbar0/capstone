@@ -107,6 +107,19 @@ def _():
         {**feature, "field_id": make_field_id(feature["name"])} for feature in BASE_CONTRACT
     ]
 
+    NUMERIC_FEATURE_NAMES = [
+        feature["name"] for feature in FEATURE_CONTRACT if feature["kind"] == "numeric"
+    ]
+    CATEGORICAL_FEATURE_NAMES = [
+        feature["name"] for feature in FEATURE_CONTRACT if feature["kind"] == "categorical"
+    ]
+
+    def normalize_category_text(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        collapsed = re.sub(r"\s+", " ", value).strip()
+        return collapsed if collapsed else np.nan
+
     def parse_price(value: str) -> float:
         if pd.isna(value) or not isinstance(value, str):
             return np.nan
@@ -145,6 +158,10 @@ def _():
         )
 
         frame["OWNERSHIP_SHARE"] = frame.get("SHARE", "").apply(parse_share)
+
+        for column in CATEGORICAL_FEATURE_NAMES:
+            if column in frame:
+                frame[column] = frame[column].map(normalize_category_text)
         return frame
 
     raw_df = pd.read_csv(DATA_PATH)
@@ -169,16 +186,23 @@ def _():
         for feature in FEATURE_CONTRACT:
             name = feature["name"]
             if feature["kind"] == "categorical" and name in df:
-                values = df[name].dropna().unique().tolist()
-                options[name] = sorted(map(str, values))
+                series = df[name].dropna()
+                if series.empty:
+                    options[name] = []
+                    continue
+                cleaned = (
+                    series.astype(str)
+                    .str.replace(r"\s+", " ", regex=True)
+                    .str.strip()
+                )
+                cleaned = cleaned[cleaned != ""]
+                options[name] = sorted(cleaned.drop_duplicates().tolist())
         return options
 
     feature_defaults_map = _feature_defaults(engineered_df)
     feature_options_map = _feature_options(engineered_df)
 
-    numeric_features = [feature["name"] for feature in FEATURE_CONTRACT if feature["kind"] == "numeric"]
-    categorical_features = [feature["name"] for feature in FEATURE_CONTRACT if feature["kind"] == "categorical"]
-    feature_order = numeric_features + categorical_features
+    feature_order = NUMERIC_FEATURE_NAMES + CATEGORICAL_FEATURE_NAMES
 
     location_activity = engineered_df.groupby("LOCATION").size().to_dict()
     storey_suggestions = (
@@ -218,8 +242,8 @@ def _():
 
         preprocessor = ColumnTransformer(
             transformers=[
-                ("numeric", numeric_pipeline, numeric_features),
-                ("categorical", categorical_pipeline, categorical_features),
+                ("numeric", numeric_pipeline, NUMERIC_FEATURE_NAMES),
+                ("categorical", categorical_pipeline, CATEGORICAL_FEATURE_NAMES),
             ]
         )
 
