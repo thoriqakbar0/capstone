@@ -69,6 +69,7 @@ def _():
     import re
     from dataclasses import dataclass
     from joblib import dump, load
+    import lightgbm as lgb
     from lightgbm import LGBMRegressor
     from pathlib import Path
     from sklearn.compose import ColumnTransformer
@@ -363,7 +364,7 @@ def _():
         }
 
 
-    def build_model_pipeline() -> Pipeline:
+    def build_preprocessor() -> ColumnTransformer:
         numeric_pipeline = Pipeline(
             steps=[
                 ("imputer", SimpleImputer(strategy="median")),
@@ -374,42 +375,86 @@ def _():
         categorical_pipeline = Pipeline(
             steps=[
                 ("imputer", SimpleImputer(strategy="most_frequent")),
-                (
-                    "encoder",
-                    OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-                ),
+                ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
             ]
         )
 
-        preprocessor = ColumnTransformer(
+        return ColumnTransformer(
             transformers=[
                 ("numeric", numeric_pipeline, NUMERIC_FEATURE_NAMES),
                 ("categorical", categorical_pipeline, CATEGORICAL_FEATURE_NAMES),
             ]
         )
 
-        model = LGBMRegressor(
-            random_state=42,
-            n_estimators=500,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-        )
-
+    def build_model_pipeline() -> Pipeline:
         return Pipeline(
             [
-                ("preprocess", preprocessor),
-                ("model", model),
+                ("preprocess", build_preprocessor()),
+                ("model", LGBMRegressor(
+                    random_state=42,
+                    n_estimators=500,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                )),
             ]
         )
+
+
+    def _build_training_history_df(evals_result: dict[str, dict[str, list[float]]]) -> pd.DataFrame:
+        if not evals_result:
+            return pd.DataFrame(columns=["iteration", "dataset", "metric", "value"])
+        records: list[dict[str, object]] = []
+        for dataset_name, metrics_map in evals_result.items():
+            friendly_dataset = dataset_name.replace('validation_0', 'Train').replace('validation_1', 'Validation')
+            for metric_name, values in metrics_map.items():
+                for idx, metric_value in enumerate(values, start=1):
+                    records.append(
+                        {
+                            "iteration": idx,
+                            "dataset": friendly_dataset,
+                            "metric": metric_name.upper(),
+                            "value": float(metric_value),
+                        }
+                    )
+        return pd.DataFrame.from_records(records)
+
+    def _compute_feature_importance(preprocessor: ColumnTransformer | None, model: LGBMRegressor) -> pd.DataFrame:
+        importances = getattr(model, "feature_importances_", None)
+        if importances is None:
+            return pd.DataFrame(columns=["feature", "importance"])
+        try:
+            feature_names = preprocessor.get_feature_names_out() if preprocessor is not None else None
+        except Exception:
+            feature_names = None
+        if feature_names is None:
+            feature_names = [f"feature_{idx}" for idx in range(len(importances))]
+        importance_df = pd.DataFrame(
+            {
+                "feature": feature_names,
+                "importance": importances,
+            }
+        )
+        importance_df = importance_df.sort_values("importance", ascending=False).reset_index(drop=True)
+        return importance_df
 
     def train_model(clicks: int, reuse_existing: bool):
         should_load = reuse_existing and MODEL_PATH.exists() and clicks == 0
         if should_load:
             pipeline = load(MODEL_PATH)
             metrics = None
+            training_history_df = pd.DataFrame()
+            feature_importance_df = pd.DataFrame()
+            if pipeline is not None:
+                try:
+                    model = pipeline.named_steps.get("model")
+                    preprocessor = pipeline.named_steps.get("preprocess")
+                    if model is not None and hasattr(model, "feature_importances_"):
+                        feature_importance_df = _compute_feature_importance(preprocessor, model)
+                except Exception:
+                    feature_importance_df = pd.DataFrame()
             status = f"Loaded cached model from {MODEL_PATH}"
-            return status, metrics, pipeline
+            return status, metrics, pipeline, training_history_df, feature_importance_df
 
         prepared = engineered_df.dropna(subset=["PRICE"])
         missing_columns = [
@@ -428,22 +473,52 @@ def _():
             random_state=42,
         )
 
-        pipeline = build_model_pipeline()
-        pipeline.fit(X_train, y_train)
+        preprocessor = build_preprocessor()
+        X_train_processed = preprocessor.fit_transform(X_train, y_train)
+        X_test_processed = preprocessor.transform(X_test)
 
-        y_pred = pipeline.predict(X_test)
+        model = LGBMRegressor(
+            random_state=42,
+            n_estimators=500,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+        )
+
+        evals_result: dict[str, dict[str, list[float]]] = {}
+        callbacks = [
+            lgb.callback.record_evaluation(evals_result),
+            lgb.callback.log_evaluation(period=0),
+        ]
+
+        model.fit(
+            X_train_processed,
+            y_train,
+            eval_set=[(X_train_processed, y_train), (X_test_processed, y_test)],
+            eval_metric=["rmse", "l1"],
+            callbacks=callbacks,
+        )
+
+        y_pred = model.predict(X_test_processed)
         metrics = {
             "MAE": float(mean_absolute_error(y_test, y_pred)),
             "RMSE": float(np.sqrt(mean_squared_error(y_test, y_pred))),
             "R2": float(r2_score(y_test, y_pred)),
         }
 
+        training_history_df = _build_training_history_df(evals_result)
+        feature_importance_df = _compute_feature_importance(preprocessor, model)
+
+        pipeline = Pipeline([
+            ("preprocess", preprocessor),
+            ("model", model),
+        ])
+
         dump(pipeline, MODEL_PATH)
         status = (
             f"Trained LightGBM on {len(X_train)} rows and saved to {MODEL_PATH.name}."
         )
-        return status, metrics, pipeline
-
+        return status, metrics, pipeline, training_history_df, feature_importance_df
     context = {
         "train_model": train_model,
         "feature_contract": FEATURE_CONTRACT,
@@ -480,18 +555,18 @@ def _(context, mo):
 
     @mo.cache
     def compute_training(clicks: int, reuse_existing: bool):
-        status, metrics, pipeline = context["train_model"](clicks, reuse_existing)
-        return status, metrics, pipeline
+        status, metrics, pipeline, training_history_df, feature_importance_df = context["train_model"](clicks, reuse_existing)
+        return status, metrics, pipeline, training_history_df, feature_importance_df
 
     return compute_training, reuse_toggle, train_button, training_controls
 
 
 @app.cell
 def _(compute_training, reuse_toggle, train_button):
-    status_msg, metrics_dict, pipeline = compute_training(
+    status_msg, metrics_dict, pipeline, training_history_df, feature_importance_df = compute_training(
         train_button.value, reuse_toggle.value
     )
-    return metrics_dict, pipeline, status_msg
+    return metrics_dict, pipeline, status_msg, training_history_df, feature_importance_df
 
 
 @app.cell
@@ -560,6 +635,8 @@ def _(
     prediction_form,
     status_msg,
     training_controls,
+    training_history_df,
+    feature_importance_df,
 ):
     ctx_defaults = context["feature_defaults"]
     ctx_location_activity = context["location_activity"]
@@ -871,6 +948,72 @@ def _(
                 multiple=False,
             )
 
+
+
+    model_section = None
+    diag_history_df = training_history_df if isinstance(training_history_df, pd.DataFrame) else pd.DataFrame()
+    diag_importance_df = feature_importance_df if isinstance(feature_importance_df, pd.DataFrame) else pd.DataFrame()
+
+    if alt_module is not None and callable(altair_chart_fn):
+        model_cards: list[object] = []
+
+        history_df = diag_history_df.copy()
+        if not history_df.empty:
+            if "metric" in history_df:
+                metric_series = history_df["metric"].astype(str)
+                history_rmse = history_df[metric_series.str.upper() == "RMSE"]
+            else:
+                history_rmse = history_df
+            if not history_rmse.empty:
+                training_chart = (
+                    alt_module.Chart(history_rmse)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt_module.X("iteration:Q", title="Iteration"),
+                        y=alt_module.Y("value:Q", title="RMSE"),
+                        color=alt_module.Color("dataset:N", title="Dataset"),
+                        tooltip=[
+                            alt_module.Tooltip("dataset:N", title="Dataset"),
+                            alt_module.Tooltip("iteration:Q", title="Iteration"),
+                            alt_module.Tooltip("value:Q", title="RMSE", format=",.3f"),
+                        ],
+                    )
+                    .properties(height=260)
+                    .interactive()
+                )
+                model_cards.append(card("LightGBM RMSE Curve", altair_chart_fn(training_chart), kind="info"))
+
+        importance_df = diag_importance_df.copy()
+        if not importance_df.empty:
+            top_importance = importance_df.head(20)
+            importance_chart = (
+                alt_module.Chart(top_importance)
+                .mark_bar(color="#7c3aed")
+                .encode(
+                    x=alt_module.X("importance:Q", title="Importance"),
+                    y=alt_module.Y("feature:N", sort="-x", title="Feature"),
+                    tooltip=[
+                        alt_module.Tooltip("feature:N", title="Feature"),
+                        alt_module.Tooltip("importance:Q", title="Importance", format=",.0f"),
+                    ],
+                )
+                .properties(height=300)
+            )
+            model_cards.append(card("Feature Importance", altair_chart_fn(importance_chart), kind="neutral"))
+
+        if model_cards:
+            model_section = mo.accordion(
+                {"Model Training": mo.vstack(model_cards, align="stretch", gap=0.8)},
+                multiple=False,
+            )
+
+    if model_section is None:
+        fallback = mo.callout(
+            "Train or refresh the model to view LightGBM diagnostics.",
+            kind="neutral",
+        )
+        model_section = mo.accordion({"Model Training": fallback}, multiple=False)
+
     if market_section is None:
         fallback_items: list[object] = []
         if highlight_block is not None:
@@ -1025,6 +1168,7 @@ def _(
         sections.append(advanced_section)
     sections.append(auto_section)
     sections.append(market_section)
+    sections.append(model_section)
     sections.extend(
         [
             bundled_form_section,
