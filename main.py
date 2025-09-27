@@ -10,6 +10,13 @@ def _():
     return (mo,)
 
 
+@app.cell
+def _():
+    from marimo import create_asgi_app
+
+    return (create_asgi_app,)
+
+
 @app.cell(hide_code=True)
 def _():
     return
@@ -523,6 +530,55 @@ def _(
 
     mo.vstack(sections, align="stretch", gap=1.2)
     return
+
+
+@app.cell
+def _(Path, create_asgi_app):
+    try:
+        from fastapi import FastAPI
+    except ImportError:  # pragma: no cover - fastapi optional
+        FastAPI = None
+
+    def build_fastapi_app(
+        base_path: str = "/",
+        *,
+        include_code: bool = True,
+        quiet: bool = False,
+    ):
+        if FastAPI is None:
+            raise ImportError(
+                "FastAPI is not installed. Install it with `uv add fastapi uvicorn`"
+            )
+
+        normalized = base_path if base_path.startswith("/") else f"/{base_path}"
+        if normalized != "/":
+            normalized = normalized.rstrip("/")
+
+        server = create_asgi_app(include_code=include_code, quiet=quiet).with_app(
+            path=normalized,
+            root=Path(__file__).resolve(),
+        )
+
+        fastapi_app = FastAPI()
+
+        @fastapi_app.get("/health", tags=["internal"])
+        def health_check():  # pragma: no cover - simple endpoint
+            return {"status": "ok"}
+
+        fastapi_app.mount(normalized, server.build())
+        return fastapi_app
+
+    return (build_fastapi_app,)
+
+
+@app.cell
+def _(build_fastapi_app):
+    try:
+        fastapi_app = build_fastapi_app()
+    except ImportError:  # FastAPI not available; expose None for clarity
+        fastapi_app = None
+
+    return (fastapi_app,)
 
 
 if __name__ == "__main__":
