@@ -290,10 +290,13 @@ def _():
 
 @app.cell
 def _(context, mo):
-    train_button = mo.ui.run_button(label="Train / Refresh LightGBM")
+    train_button = mo.ui.run_button(label="Train / Refresh LightGBM", full_width=True)
     reuse_toggle = mo.ui.switch(label="Reuse saved model if available", value=True)
 
-    training_controls = mo.hstack([train_button, reuse_toggle], align="center", gap=1.0)
+    training_controls = mo.hstack([
+        train_button,
+        reuse_toggle,
+    ], align="center", gap=1.0, wrap=True)
 
     @mo.cache
     def compute_training(clicks: int, reuse_existing: bool):
@@ -327,6 +330,7 @@ def _(context, mo):
                 label=name,
                 value=float(initial_value) if initial_value is not None else 0.0,
                 step=1,
+                full_width=True,
             )
         else:
             options = options_map.get(name, [])
@@ -335,6 +339,8 @@ def _(context, mo):
                 options=options or [initial_choice],
                 value=initial_choice,
                 label=name,
+                full_width=True,
+                searchable=True,
             )
 
         controls[field_id] = element
@@ -420,7 +426,7 @@ def _(
             mo.hstack([
                 mo.icon("lucide:home", size=26),
                 mo.md("## Malaysian Property Price Predictor"),
-            ], gap=0.5, align="center"),
+            ], gap=0.5, align="center", wrap=True),
             mo.md("_Simplified version — just 3 inputs: Area + Building Type + Location_"),
             status_callout,
             training_controls,
@@ -442,7 +448,10 @@ def _(
     ]
 
     property_section = mo.vstack(
-        [mo.md("### Property Details"), mo.hstack(property_cards, gap=1, widths="equal")],
+        [
+            mo.md("### Property Details"),
+            mo.hstack(property_cards, gap=1, widths=[1] * len(property_cards), wrap=True),
+        ],
         align="stretch",
         gap=0.6,
     )
@@ -461,7 +470,8 @@ def _(
             card("Location Activity", mo.md(f"{location_activity_count} transactions"), kind="info"),
         ],
         gap=1,
-        widths="equal",
+        widths=[1, 1, 1],
+        wrap=True,
     )
     auto_section = mo.vstack(
         [mo.md("### Auto-Calculated Values"), auto_cards], align="stretch", gap=0.6
@@ -532,8 +542,18 @@ def _(
         prediction_section = mo.vstack(
             [
                 mo.md("### Price Prediction"),
-                mo.hstack([price_callout, pps_callout], gap=1, widths="equal"),
-                mo.hstack([range_callout, comparison_callout], gap=1, widths="equal"),
+                mo.hstack(
+                    [price_callout, pps_callout],
+                    gap=1,
+                    widths=[1, 1],
+                    wrap=True,
+                ),
+                mo.hstack(
+                    [range_callout, comparison_callout],
+                    gap=1,
+                    widths=[1, 1],
+                    wrap=True,
+                ),
             ],
             align="stretch",
             gap=0.6,
