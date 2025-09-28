@@ -692,7 +692,7 @@ def _(
     ctx_building_summary = context.get("building_type_summary", pd.DataFrame())
     ctx_trend_summary = context.get("trend_summary", {})
 
-    area_quantiles = ctx_area_stats.get("quantiles", {})
+    ctx_area_quantiles = ctx_area_stats.get("quantiles", {})
     SQM_TO_SQFT = 10.7639
 
     primary_names = ["AREA", "BUILDING TYPE", "LOCATION"]
@@ -771,10 +771,10 @@ def _(
         card("Location", controls[name_to_field["LOCATION"]]),
     ]
 
-    q10_area = area_quantiles.get("q10") if isinstance(area_quantiles, dict) else None
-    q90_area = area_quantiles.get("q90") if isinstance(area_quantiles, dict) else None
-    min_area = area_quantiles.get("min") if isinstance(area_quantiles, dict) else None
-    max_area = area_quantiles.get("max") if isinstance(area_quantiles, dict) else None
+    q10_area = ctx_area_quantiles.get("q10") if isinstance(ctx_area_quantiles, dict) else None
+    q90_area = ctx_area_quantiles.get("q90") if isinstance(ctx_area_quantiles, dict) else None
+    min_area = ctx_area_quantiles.get("min") if isinstance(ctx_area_quantiles, dict) else None
+    max_area = ctx_area_quantiles.get("max") if isinstance(ctx_area_quantiles, dict) else None
 
     area_range_notice = None
     if (
@@ -1297,7 +1297,7 @@ def _(
             live_area,
             estimate,
             reference_rate,
-            area_quantiles if isinstance(area_quantiles, dict) else {},
+            ctx_area_quantiles if isinstance(ctx_area_quantiles, dict) else {},
         )
 
         adjusted_estimate = calibration.get("adjusted_price") or estimate
