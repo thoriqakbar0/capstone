@@ -216,6 +216,36 @@ def _():
             "AREA"
         ].astype(float)
 
+    valid_area_mask = (
+        engineered_df["PRICE"].astype(float).notna()
+        & engineered_df["AREA"].astype(float).notna()
+        & (engineered_df["AREA"].astype(float) > 0)
+    )
+
+    area_series = engineered_df.loc[valid_area_mask, "AREA"].astype(float)
+
+    area_quantiles = {
+        "min": float(area_series.min()) if not area_series.empty else 0.0,
+        "q10": float(area_series.quantile(0.10)) if not area_series.empty else 0.0,
+        "median": float(area_series.quantile(0.50)) if not area_series.empty else 0.0,
+        "q90": float(area_series.quantile(0.90)) if not area_series.empty else 0.0,
+        "max": float(area_series.max()) if not area_series.empty else 0.0,
+    }
+
+    price_per_sqm_by_location: dict[str, float] = {}
+    if valid_area_mask.any():
+        per_location = engineered_df.loc[
+            valid_area_mask & engineered_df["LOCATION"].notna(),
+            ["LOCATION", "AREA", "PRICE"],
+        ].copy()
+        if not per_location.empty:
+            per_location["AREA"] = per_location["AREA"].astype(float)
+            per_location["PRICE"] = per_location["PRICE"].astype(float)
+            per_location["PRICE_PER_SQM"] = per_location["PRICE"] / per_location["AREA"]
+            price_per_sqm_by_location = (
+                per_location.groupby("LOCATION")["PRICE_PER_SQM"].median().dropna().astype(float).to_dict()
+            )
+
     price_per_sqft_median = (
         float(np.nanmedian(price_per_sqft_series))
         if price_per_sqft_series.notna().any()
@@ -529,6 +559,8 @@ def _():
         "storey_suggestions": storey_suggestions,
         "price_per_sqft_median": price_per_sqft_median,
         "area_to_mfa_ratio": area_to_mfa_ratio,
+        "area_stats": {"quantiles": area_quantiles},
+        "price_per_sqm_by_location": price_per_sqm_by_location,
         "date_window": date_window,
         "monthly_price_trend": monthly_price_trend,
         "location_summary": top_location_summary,
@@ -652,11 +684,16 @@ def _(
     ctx_storey_suggestions = context["storey_suggestions"]
     ctx_price_per_sqft_median = context["price_per_sqft_median"]
     ctx_area_to_mfa_ratio = context["area_to_mfa_ratio"]
+    ctx_area_stats = context.get("area_stats", {})
+    ctx_price_per_sqm_by_location = context.get("price_per_sqm_by_location", {})
     ctx_date_window = context["date_window"]
     ctx_monthly_trend = context.get("monthly_price_trend", pd.DataFrame())
     ctx_location_summary = context.get("location_summary", pd.DataFrame())
     ctx_building_summary = context.get("building_type_summary", pd.DataFrame())
     ctx_trend_summary = context.get("trend_summary", {})
+
+    area_quantiles = ctx_area_stats.get("quantiles", {})
+    SQM_TO_SQFT = 10.7639
 
     primary_names = ["AREA", "BUILDING TYPE", "LOCATION"]
     advanced_names = [
@@ -734,6 +771,26 @@ def _(
         card("Location", controls[name_to_field["LOCATION"]]),
     ]
 
+    q10_area = area_quantiles.get("q10") if isinstance(area_quantiles, dict) else None
+    q90_area = area_quantiles.get("q90") if isinstance(area_quantiles, dict) else None
+    min_area = area_quantiles.get("min") if isinstance(area_quantiles, dict) else None
+    max_area = area_quantiles.get("max") if isinstance(area_quantiles, dict) else None
+
+    area_range_notice = None
+    if (
+        isinstance(q10_area, (int, float))
+        and isinstance(q90_area, (int, float))
+        and q10_area > 0
+        and q90_area > 0
+    ):
+        range_text = (
+            f"Model training focused on areas between **{q10_area:,.0f}** and **{q90_area:,.0f}** sq m. "
+            "Enter property size in square metres (1 sq m ≈ 10.764 sq ft)."
+        )
+        if isinstance(min_area, (int, float)) and isinstance(max_area, (int, float)) and max_area > 0:
+            range_text += f" Observed dataset range: {min_area:,.0f}–{max_area:,.0f} sq m."
+        area_range_notice = mo.callout(mo.md(range_text), kind="neutral")
+
     detailed_mode = bool(prediction_mode_switch.value)
     mode_label = "Detailed" if detailed_mode else "Quick"
 
@@ -809,6 +866,63 @@ def _(
         except ImportError:
             alt_module = None
 
+    def calibrate_prediction(
+        area: float | None,
+        raw_price: float | None,
+        reference_rate: float | None,
+        quantiles: dict[str, float],
+    ) -> dict[str, float | None]:
+        try:
+            area_val = float(area) if area is not None else 0.0
+        except (TypeError, ValueError):
+            area_val = 0.0
+
+        try:
+            raw_price_val = float(raw_price) if raw_price is not None else None
+        except (TypeError, ValueError):
+            raw_price_val = None
+
+        raw_rate = raw_price_val / area_val if raw_price_val is not None and area_val > 0 else None
+
+        try:
+            reference_rate_val = float(reference_rate) if reference_rate is not None else None
+        except (TypeError, ValueError):
+            reference_rate_val = None
+
+        min_area = float(quantiles.get("min") or 0.0)
+        q10 = float(quantiles.get("q10") or 0.0)
+        q90 = float(quantiles.get("q90") or 0.0)
+        max_area = float(quantiles.get("max") or 0.0)
+
+        blend_weight = 0.0
+        if area_val > 0 and q10 > 0 and q90 > 0 and max_area > 0:
+            if area_val < q10:
+                denominator = max(q10 - max(min_area, 0.0), 1e-9)
+                blend_weight = min(1.0, (q10 - area_val) / denominator)
+            elif area_val > q90:
+                denominator = max(max_area - q90, 1e-9)
+                blend_weight = min(1.0, (area_val - q90) / denominator)
+
+        blend_weight = max(0.0, min(blend_weight, 1.0))
+
+        if reference_rate_val is None:
+            reference_rate_val = raw_rate if raw_rate is not None else 0.0
+
+        if raw_rate is None:
+            adjusted_rate = reference_rate_val
+        else:
+            adjusted_rate = (1.0 - blend_weight) * raw_rate + blend_weight * reference_rate_val
+
+        adjusted_price = adjusted_rate * area_val if area_val > 0 else raw_price_val
+
+        return {
+            "raw_rate": raw_rate,
+            "adjusted_rate": adjusted_rate,
+            "adjusted_price": adjusted_price,
+            "blend_weight": blend_weight,
+            "reference_rate": reference_rate_val,
+        }
+
     def format_rm(value: float | None) -> str:
         if value is None:
             return "RM —"
@@ -818,6 +932,28 @@ def _(
         except TypeError:
             pass
         return f"RM {float(value):,.0f}"
+
+    def format_rate(value: float | None) -> str:
+        if value is None:
+            return "—"
+        try:
+            if pd.isna(value):
+                return "—"
+        except TypeError:
+            pass
+        return f"{float(value):,.0f} RM/m²"
+
+    def format_rate_pair(value: float | None) -> str:
+        if value is None or (isinstance(value, (int, float)) and value <= 0):
+            return "—"
+        try:
+            rate_val = float(value)
+        except (TypeError, ValueError):
+            return "—"
+        per_sqft = rate_val / SQM_TO_SQFT if SQM_TO_SQFT else 0.0
+        if per_sqft <= 0:
+            return f"{rate_val:,.0f} RM/m²"
+        return f"{rate_val:,.0f} RM/m²\n\n_{per_sqft:,.0f} RM/ft²_"
 
     def format_pct(value: float | None) -> str:
         if value is None:
@@ -1127,8 +1263,13 @@ def _(
 
     prediction = predict_price(submitted_payload) if prediction_ready else None
 
-    def format_currency(value: float) -> str:
-        return f"RM {value:,.0f}" if value is not None else "RM 0"
+    def format_currency(value: float | None) -> str:
+        if value is None:
+            return "RM —"
+        try:
+            return f"RM {float(value):,.0f}"
+        except (TypeError, ValueError):
+            return "RM —"
 
     if pipeline is None:
         prediction_section = mo.callout(
@@ -1148,42 +1289,100 @@ def _(
         estimate = prediction["prediction"]
         low = prediction["low"]
         high = prediction["high"]
-        price_per_sq_m = estimate / max(live_area, 1.0)
+
+        reference_rate = ctx_price_per_sqm_by_location.get(
+            str(live_location), ctx_price_per_sqft_median
+        )
+        calibration = calibrate_prediction(
+            live_area,
+            estimate,
+            reference_rate,
+            area_quantiles if isinstance(area_quantiles, dict) else {},
+        )
+
+        adjusted_estimate = calibration.get("adjusted_price") or estimate
+        blend_weight = float(calibration.get("blend_weight") or 0.0)
+        raw_rate = calibration.get("raw_rate")
+        calibrated_rate = calibration.get("adjusted_rate") or raw_rate
+        comparison_rate = calibration.get("reference_rate") or ctx_price_per_sqft_median
+
+        price_per_sq_m = (
+            calibrated_rate
+            if calibrated_rate is not None
+            else (estimate / max(live_area, 1.0) if live_area else None)
+        )
+        raw_price_per_sq_m = (
+            raw_rate
+            if raw_rate is not None
+            else (estimate / max(live_area, 1.0) if live_area else None)
+        )
+
+        adjusted_low = adjusted_estimate * 0.9 if adjusted_estimate is not None else low
+        adjusted_high = adjusted_estimate * 1.1 if adjusted_estimate is not None else high
 
         price_callout = card(
-            "Estimated Price", mo.md(format_currency(estimate)), kind="success"
+            "Calibrated Price", mo.md(format_currency(adjusted_estimate)), kind="success"
+        )
+        raw_price_callout = card(
+            "Raw Model Price", mo.md(format_currency(estimate)), kind="neutral"
         )
         pps_callout = card(
-            "Price per sq m", mo.md(f"{price_per_sq_m:,.0f}"), kind="neutral"
+            "Calibrated Price per sq m",
+            mo.md(format_rate_pair(price_per_sq_m)),
+            kind="info",
+        )
+        raw_pps_callout = card(
+            "Raw Price per sq m",
+            mo.md(format_rate_pair(raw_price_per_sq_m)),
+            kind="neutral",
         )
         range_callout = card(
-            "Estimated Range",
-            mo.md(f"{format_currency(low)} – {format_currency(high)}"),
+            "Calibrated Range",
+            mo.md(
+                f"{format_currency(adjusted_low)} – {format_currency(adjusted_high)}"
+            ),
             kind="success",
         )
 
+        comparison_label = (
+            f"Reference Median ({live_location})"
+            if str(live_location) in ctx_price_per_sqm_by_location
+            else "Dataset Median"
+        )
         comparison_callout = card(
-            "Dataset Median Price/m²",
-            mo.md(f"{ctx_price_per_sqft_median:,.0f}"),
+            comparison_label,
+            mo.md(format_rate_pair(comparison_rate)),
             kind="info",
         )
 
+        calibration_notice = None
+        if blend_weight > 0 and isinstance(q10_area, (int, float)) and isinstance(q90_area, (int, float)):
+            raw_rate_text = format_rate(raw_price_per_sq_m)
+            calibrated_rate_text = format_rate(price_per_sq_m)
+            reference_rate_text = format_rate(comparison_rate)
+            calibration_notice = mo.callout(
+                mo.md(
+                    (
+                        f"Input area **{live_area:,.0f} sq m** sits outside the training band "
+                        f"{q10_area:,.0f}–{q90_area:,.0f} sq m. We blended {blend_weight*100:,.0f}% of the "
+                        f"reference rate ({reference_rate_text}) with the raw model rate ({raw_rate_text}) to produce "
+                        f"the calibrated rate ({calibrated_rate_text})."
+                    )
+                ),
+                kind="warn",
+            )
+
+        prediction_blocks = [
+            mo.md(f"### {mode_label} Prediction"),
+            mo.hstack([price_callout, raw_price_callout], gap=1, widths=[1, 1], wrap=True),
+            mo.hstack([pps_callout, raw_pps_callout], gap=1, widths=[1, 1], wrap=True),
+            mo.hstack([range_callout, comparison_callout], gap=1, widths=[1, 1], wrap=True),
+        ]
+        if calibration_notice is not None:
+            prediction_blocks.append(calibration_notice)
+
         prediction_section = mo.vstack(
-            [
-                mo.md(f"### {mode_label} Prediction"),
-                mo.hstack(
-                    [price_callout, pps_callout],
-                    gap=1,
-                    widths=[1, 1],
-                    wrap=True,
-                ),
-                mo.hstack(
-                    [range_callout, comparison_callout],
-                    gap=1,
-                    widths=[1, 1],
-                    wrap=True,
-                ),
-            ],
+            prediction_blocks,
             align="stretch",
             gap=0.6,
         )
@@ -1193,8 +1392,10 @@ def _(
         mo.hstack(
             property_cards, gap=1, widths=[1] * len(property_cards), wrap=True
         ),
-        mode_controls_row,
     ]
+    if area_range_notice is not None:
+        property_content.append(area_range_notice)
+    property_content.append(mode_controls_row)
     if not detailed_mode:
         property_content.append(prediction_section)
     property_content.append(prediction_mode_card)
